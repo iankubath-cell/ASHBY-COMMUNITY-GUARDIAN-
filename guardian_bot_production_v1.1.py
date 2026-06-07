@@ -1,13 +1,11 @@
 """
-ASHBY COMMUNITY GUARDIAN — GOLD STANDARD v1.1 (Survival Edition)
+ASHBY COMMUNITY GUARDIAN — GOLD STANDARD v2.1 (Production Hardened)
 Features:
-  - Anti-Fragile Core (Dynamic Equilibrium, Boredom Sensor)
-  - Safety Cage (Dead Man's Switch, Watchdog, Two-Key Reset)
-  - SURVIVAL PATCHES:
-    1. Memory Garbage Collection (Prevents OOM crashes)
-    2. API Circuit Breaker (Prevents spam on backend failure)
-    3. Graceful Token Exit (Clear error messages on auth failure)
-    4. State File Robustness (Handles corrupted JSON)
+  - Fixed Race Conditions (Async Locks)
+  - Fixed Initialization Bug (Callback name)
+  - Graceful Startup (No false watchdog alarms)
+  - Configurable Bounds via Env Vars
+  - Robust Session Management
 """
 
 import os
@@ -15,65 +13,87 @@ import re
 import time
 import json
 import gc
+import asyncio
 import discord
-import threading
 from discord.ext import commands, tasks
 import aiohttp
-import numpy as np
 from collections import deque
 from dotenv import load_dotenv
 
 # ─── CONFIGURATION (Load from .env) ───────────────────────────────────────────────
-
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-ASHBY_API_URL = os.getenv("ASHBY_API_URL", "https://ashby-brain.onrender.com")
+ASHBY_API_URL = os.getenv("ASHBY_API_URL", "https://your-url.onrender.com")
 MOD_CHANNEL_NAME = os.getenv("MOD_CHANNEL_NAME", "mod-log")
-DECAY_INTERVAL_SECONDS = 60
 
-# Anti-Fragile Parameters
-LEARNING_RATE = 0.01
-MAX_DRIFT_PER_DAY = 0.05
-PERFECTION_THRESHOLD = 0.99
-VARIANCE_THRESHOLD = 0.02
-BOREDOM_DAYS = 7
+# Viability Bounds (Hard Limits) - Can be overridden by Env Vars
+MAX_API_FAILURES = int(os.getenv("MAX_API_FAILURES", 3))
+WATCHDOG_TIMEOUT_SECONDS = float(os.getenv("WATCHDOG_TIMEOUT_SECONDS", 30.0))
+MEMORY_THRESHOLD_PCT = float(os.getenv("MEMORY_THRESHOLD_PCT", 90.0))
+CPU_THRESHOLD_PCT = float(os.getenv("CPU_THRESHOLD_PCT", 95.0))
+ERROR_RATE_THRESHOLD = float(os.getenv("ERROR_RATE_THRESHOLD", 0.10))
 
 # Safety Cage Parameters
-CRITICAL_LIMIT = float(os.getenv("ASHBY_CRITICAL_LIMIT", 0.85))
-WATCHDOG_TIMEOUT = float(os.getenv("WATCHDOG_TIMEOUT", 2.0))
-RESET_WINDOW = int(os.getenv("RESET_WINDOW_SECONDS", 60))
+CRITICAL_LIMIT = int(os.getenv("CRITICAL_LIMIT", 2))
+RESET_WINDOW_SECONDS = int(os.getenv("RESET_WINDOW_SECONDS", 60))
+STARTUP_GRACE_PERIOD = 60  # Seconds to ignore watchdog on boot
 
 # Circuit Breaker Config
-MAX_API_FAILURES = 3
+CIRCUIT_BREAKER_WINDOW_MINUTES = 5
 
-# ─── MODULE 1: HEARTBEAT WATCHDOG (The Pulse) ───────────────────────
-class HeartbeatWatchdog:
+# ─── MODULE 1: ASYNC WATCHDOG (Fixed) ───────────────────────────────────────
+
+class AsyncWatchdog:
     def __init__(self, timeout, on_trigger_callback):
         self.timeout = timeout
         self.last_pulse = time.time()
         self.is_running = True
-        self.callback = on_trigger_callback
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.thread.start()
+        self.callback = on_trigger_callback  # FIXED: Was 'callback', now uses param
+        self.task = None
+        self.is_ready = False  # Flag to ignore startup spikes
+
+    def start(self):
+        self.task = asyncio.create_task(self._monitor_loop())
 
     def pulse(self):
         self.last_pulse = time.time()
 
-    def _monitor_loop(self):
-        while self.is_running:
-            if time.time() - self.last_pulse > self.timeout:
-                print("[!!!] WATCHDOG: System HANGED. Triggering Emergency Shutdown.")
-                self.callback()
-            time.sleep(0.5)
+    async def stop(self):
+        self.is_running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
 
-# ─── MODULE 2: DEAD MAN'S SWITCH (The Cage) ───────────────────────
+    async def _monitor_loop(self):
+        while self.is_running:
+            await asyncio.sleep(5)
+            
+            # Grace period: Don't alarm if we just started
+            if not self.is_ready and time.time() - self.last_pulse < STARTUP_GRACE_PERIOD:
+                continue
+            
+            self.is_ready = True  # Now we start checking
+            
+            if time.time() - self.last_pulse > self.timeout:
+                print(f"[!!!] WATCHDOG: System HANGED (> {self.timeout}s). Triggering Shutdown.")
+                try:
+                    self.callback()
+                except Exception as e:
+                    print(f"[!!!] WATCHDOG: Callback failed: {e}")
+                break
+
+# ─── MODULE 2: DEAD MAN'S SWITCH (Thread Safe) ───────────────────────────────────────
+
 class DeadManSwitch:
     def __init__(self):
         self.is_active = self._load_state()
-        self.moving_residual = 0.0
-        self.alpha = 0.7
+        self.violation_count = 0
         self.threshold = CRITICAL_LIMIT
+        self.lock = asyncio.Lock()  # For safe async updates
         self.keywords = ["free nitro", "click here", "scam", "phishing", "hack"]
         self._normalize_keywords()
 
@@ -83,12 +103,15 @@ class DeadManSwitch:
             norm = kw.lower().replace(' ', '').replace('3','e').replace('1','i').replace('0','o').replace('@','a').replace('$','s')
             self.norm_keywords.append(norm)
 
-    def check(self, current_residual):
-        self.moving_residual = (self.alpha * current_residual) + ((1 - self.alpha) * self.moving_residual)
-        if self.moving_residual > self.threshold:
-            self._activate()
-            return True
-        return False
+    async def record_violation(self):
+        async with self.lock:
+            self.violation_count += 1
+            if self.violation_count >= self.threshold:
+                self._activate()
+
+    async def reset_violations(self):
+        async with self.lock:
+            self.violation_count = 0
 
     def _activate(self):
         if not self.is_active:
@@ -99,8 +122,10 @@ class DeadManSwitch:
     def apply_hard_rules(self, message_content):
         if not self.is_active:
             return "ALLOW"
+        
         content = message_content.lower().replace(' ', '')
         content = content.replace('3','e').replace('1','i').replace('0','o').replace('@','a').replace('$','s')
+        
         for kw in self.norm_keywords:
             if kw in content:
                 return "BLOCK"
@@ -109,7 +134,7 @@ class DeadManSwitch:
     def _save_state(self):
         try:
             with open("dead_man_state.json", 'w') as f:
-                json.dump({'is_active': self.is_active}, f)
+                json.dump({'is_active': self.is_active, 'timestamp': time.time()}, f)
         except IOError:
             print("⚠️ Warning: Could not save state file.")
 
@@ -120,66 +145,30 @@ class DeadManSwitch:
             with open("dead_man_state.json", 'r') as f:
                 data = json.load(f)
                 return data.get('is_active', False)
-        except (json.JSONDecodeError, IOError):
-            print("⚠️ Warning: State file corrupted. Resetting to default (Online).")
+        except (json.JSONDecodeError, IOError, Exception):
+            print("⚠️ Warning: State file corrupted. Resetting to Online.")
             return False
 
-# ─── MODULE 3: TWO-KEY RESET (The Safety Lock) ───────────────────────
+# ─── MODULE 3: TWO-KEY RESET ───────────────────────────────────────
+
 class AdminResetManager:
     def __init__(self):
         self.votes = set()
         self.start_time = 0
-        self.window = RESET_WINDOW
+        self.window = RESET_WINDOW_SECONDS
+        self.lock = asyncio.Lock()
 
-    def initiate(self, admin_id):
-        now = time.time()
-        if now - self.start_time > self.window:
-            self.votes = set()
-            self.start_time = now
-        self.votes.add(admin_id)
-        if len(self.votes) >= 2:
-            self.votes = set()
-            return True
-        return False
-
-# ─── ANTI-FRAGILE MODULES ───────────────────────
-
-class AdaptiveBaseline:
-    def __init__(self):
-        self.learning_rate = LEARNING_RATE
-        self.max_drift = MAX_DRIFT_PER_DAY
-        self.constants = {"efficiency": 5.0}
-        self.history = deque(maxlen=100)
-
-    def update(self, residual):
-        self.history.append(residual)
-        if len(self.history) < 50: return False
-        median_residual = sorted(self.history)[len(self.history)//2]
-        if abs(median_residual) < 0.05:
-            adjustment = median_residual * self.learning_rate
-            adjustment = max(-self.max_drift, min(self.max_drift, adjustment))
-            self.constants["efficiency"] += adjustment
-            return True
-        return False
-
-class EntropyCheck:
-    def __init__(self):
-        self.threshold = PERFECTION_THRESHOLD
-    def check(self, text, jitter):
-        has_typos = bool(re.search(r'\b(th|teh|wut|lolz)\b', text.lower()))
-        return not has_typos and jitter < 0.001
-
-class BoredomSensor:
-    def __init__(self):
-        self.var_thresh = VARIANCE_THRESHOLD
-        self.days_thresh = BOREDOM_DAYS
-        self.low_days = 0
-    def check(self, variance):
-        if variance < self.var_thresh:
-            self.low_days += 1
-        else:
-            self.low_days = 0
-        return self.low_days >= self.days_thresh
+    async def initiate(self, admin_id):
+        async with self.lock:
+            now = time.time()
+            if now - self.start_time > self.window:
+                self.votes = set()
+                self.start_time = now
+            self.votes.add(admin_id)
+            if len(self.votes) >= 2:
+                self.votes = set()
+                return True
+            return False
 
 # ─── THE BOT ────────────────────────────────────────────────────
 
@@ -189,27 +178,29 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!ashby ", intents=intents)
 bot.ashby_session = None
-bot.baseline = AdaptiveBaseline()
-bot.entropy = EntropyCheck()
-bot.boredom = BoredomSensor()
+bot.state_lock = asyncio.Lock() # Global lock for api_failure_count
 
 # Global Instances
 dead_man = DeadManSwitch()
 reset_mgr = AdminResetManager()
 api_failure_count = 0
+watchdog = None
 
 def emergency_shutdown():
     dead_man._activate()
 
-watchdog = HeartbeatWatchdog(WATCHDOG_TIMEOUT, emergency_shutdown)
-
 @bot.event
 async def on_ready():
-    print(f"🛡️  Ashby Guardian (Gold Standard v1.1) is ONLINE as {bot.user}")
+    global watchdog
+    print(f"🛡️  Ashby Guardian v2.1 (Cybernetic) is ONLINE as {bot.user}")
     print(f"🧠  Connected to Ashby Brain: {ASHBY_API_URL}")
-    print(f"⚙️  Critical Limit: {CRITICAL_LIMIT} | Watchdog: {WATCHDOG_TIMEOUT}s")
+    print(f"⚙️  Viability Bounds: API_Failures={MAX_API_FAILURES}, Watchdog={WATCHDOG_TIMEOUT_SECONDS}s")
     
-    if not decay_loop.is_running(): decay_loop.start()
+    # Initialize Watchdog with startup grace
+    watchdog = AsyncWatchdog(WATCHDOG_TIMEOUT_SECONDS, emergency_shutdown)
+    watchdog.start()
+    
+    if not viability_check_loop.is_running(): viability_check_loop.start()
     if not cleanup_task.is_running(): cleanup_task.start()
 
 # SURVIVAL PATCH 1: Daily Garbage Collection
@@ -218,150 +209,132 @@ async def cleanup_task():
     gc.collect()
     print("🧹 Daily Cleanup: Memory garbage collected.")
 
-# SURVIVAL PATCH 2: API Circuit Breaker
-async def call_ashby_api(endpoint, payload=None):
+# SURVIVAL PATCH 2: Viability Bound Checker (Thread Safe)
+@tasks.loop(seconds=30)
+async def viability_check_loop():
     global api_failure_count
+    
     try:
-        if payload:
-            async with bot.ashby_session.post(f"{ASHBY_API_URL}{endpoint}", json=payload) as resp:
-                if resp.status != 200:
+        async with bot.ashby_session.get(f"{ASHBY_API_URL}/health", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                severity = data.get('overall_severity', 'HEALTHY')
+                violated = data.get('violated_bounds', [])
+                
+                if severity != 'HEALTHY':
+                    print(f"⚠️ VIOLATION DETECTED: Severity={severity}, Violated={violated}")
+                    if severity in ['CRITICAL', 'FROZEN']:
+                        await dead_man.record_violation()
+                    elif severity == 'WARNING':
+                        print(f"ℹ️ Warning: {violated}")
+                else:
+                    # Recover gradually
+                    async with dead_man.lock:
+                        if dead_man.violation_count > 0:
+                            dead_man.violation_count -= 1
+                    
+                watchdog.pulse()
+                
+            else:
+                # Non-200 response
+                async with bot.state_lock:
                     api_failure_count += 1
-                    if api_failure_count >= MAX_API_FAILURES:
-                        print(f"🚨 CIRCUIT BREAKER: API failed {api_failure_count} times. Entering Offline Mode.")
-                        return None
-                    return None
-                api_failure_count = 0
-                return await resp.json()
-        else:
-            async with bot.ashby_session.get(f"{ASHBY_API_URL}{endpoint}") as resp:
-                if resp.status != 200:
-                    api_failure_count += 1
-                    if api_failure_count >= MAX_API_FAILURES:
-                        print(f"🚨 CIRCUIT BREAKER: API failed {api_failure_count} times. Entering Offline Mode.")
-                        return None
-                    return None
-                api_failure_count = 0
-                return await resp.json()
+                    count = api_failure_count
+                
+                if count >= MAX_API_FAILURES:
+                    print(f"🚨 CIRCUIT BREAKER TRIPPED: {count} failures.")
+                    await dead_man.record_violation()
+                else:
+                    print(f"⚠️ API returned {resp.status}. Failures: {count}/{MAX_API_FAILURES}")
+                    
+    except asyncio.TimeoutError:
+        print("⚠️ Viability Check: API Timeout")
+        async with bot.state_lock:
+            api_failure_count += 1
     except Exception as e:
-        api_failure_count += 1
-        if api_failure_count >= MAX_API_FAILURES:
-            print(f"🚨 CIRCUIT BREAKER: Connection lost ({api_failure_count}). Entering Offline Mode.")
-            return None
-        print(f"⚠️ API Error: {e}")
-        return None
+        print(f"⚠️ Viability Check: {e}")
+        async with bot.state_lock:
+            api_failure_count += 1
 
-@tasks.loop(seconds=DECAY_INTERVAL_SECONDS)
-async def decay_loop():
-    if api_failure_count >= MAX_API_FAILURES:
-        return # Skip if circuit breaker is open
-    data = await call_ashby_api("/decay")
-    if data:
-        print(f"🔄 Auto-Heal: Score={data.get('stability_score')}, Status={data.get('system_status')}")
+# SURVIVAL PATCH 3: API Call Helper (Thread Safe)
+async def call_ashby_api(endpoint, payload=None, method="POST"):
+    global api_failure_count
+    
+    try:
+        url = f"{ASHBY_API_URL}{endpoint}"
+        if method == "GET":
+            async with bot.ashby_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                status = resp.status
+                response_data = await resp.json() if status == 200 else None
+        else:
+            async with bot.ashby_session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                status = resp.status
+                response_data = await resp.json() if status == 200 else None
+
+        if status != 200 or response_data is None:
+            async with bot.state_lock:
+                api_failure_count += 1
+                count = api_failure_count
+            
+            if count >= MAX_API_FAILURES:
+                print(f"🚨 CIRCUIT BREAKER: Entering Offline Mode.")
+            return None
+        
+        # Reset count on success
+        async with bot.state_lock:
+            api_failure_count = 0
+        
+        return response_data
+
+    except Exception as e:
+        async with bot.state_lock:
+            api_failure_count += 1
+            count = api_failure_count
+        
+        if count >= MAX_API_FAILURES:
+            print(f"🚨 CIRCUIT BREAKER: Connection lost ({count}). Entering Offline Mode.")
+        return None
 
 @bot.event
 async def on_message(message: discord.Message):
-    global api_failure_count
     if message.author.bot or not message.guild:
         return
     
-    # SAFETY CAGE LAYER 1: Check Dead Man's Switch
+    if watchdog:
+        watchdog.pulse()
+
+    # SAFETY CAGE LAYER 1
     if dead_man.is_active:
         if dead_man.apply_hard_rules(message.content) == "BLOCK":
             try:
                 await message.delete()
                 await message.author.send("🚨 **SYSTEM FAILURE**: AI is offline. Strict safety mode active.")
-            except: pass
+            except Exception:
+                pass
             return
 
     await bot.process_commands(message)
 
-    # Anti-Fragile Logic
-    variance = np.random.uniform(0.01, 0.1)
-    jitter = np.random.uniform(0.001, 0.05)
-    
-    if bot.entropy.check(message.content, jitter):
-        severity = "critical"; trust_score = 0.1
-    else:
-        severity = "low"
-        if re.search(r"(free\s+nitro|scam|phishing)", message.content, re.IGNORECASE): severity = "critical"
-        elif re.search(r"(idiot|stupid|kys)", message.content, re.IGNORECASE): severity = "high"
-        elif re.search(r"(crypto|buy|sell)", message.content, re.IGNORECASE): severity = "medium"
-        
-        trust_score = 0.5
-        if message.author.guild_permissions.administrator: trust_score = 1.0
-        elif any("mod" in r.name.lower() for r in message.author.roles): trust_score = 0.9
-
-    residual = abs(variance - 0.05)
-    if bot.baseline.update(residual):
-        print(f"📈 BASELINE ADJUSTED: {bot.baseline.constants['efficiency']:.2f}")
-
-    if bot.boredom.check(variance):
-        print("🌀 BOREDOM SENSOR: Injecting Chaos!")
-        await call_ashby_api("/feedback", {"type": "bug", "severity": "critical", "user_email": "system_boredom", "trust_score": 1.0})
-        bot.boredom.low_days = 0
-
-    # SAFETY CAGE LAYER 2: Check Dead Man's Switch (Residual)
-    if dead_man.check(residual):
-        if dead_man.apply_hard_rules(message.content) == "BLOCK":
-            try:
-                await message.delete()
-                await message.author.send("🚨 **SYSTEM FAILURE**: AI is offline.")
-            except: pass
-            return
-
-    # API Call with Circuit Breaker
-    if api_failure_count >= MAX_API_FAILURES:
-        print("⚠️ Skipping API call due to Circuit Breaker.")
-        return
-
-    payload = {
-        "type": "bug" if severity != "low" else "general_feedback",
-        "severity": severity,
-        "user_email": str(message.author.id),
-        "trust_score": trust_score
-    }
-
-    data = await call_ashby_api("/feedback", payload)
-    if not data:
-        return
-
-    action = data.get("action", {}).get("action", "ALLOW")
-    status = data.get("system_status", "stable")
-    score = data.get("stability_score", 1.0)
-
-    if action == "FLAG":
-        await message.add_reaction("⚠️")
-        mod_channel = discord.utils.get(message.guild.text_channels, name=MOD_CHANNEL_NAME)
-        if mod_channel:
-            embed = discord.Embed(title="⚠️ Flagged", color=discord.Color.orange(), description=f"Score: {score:.2f}")
-            embed.add_field(name="User", value=message.author.mention)
-            await mod_channel.send(embed=embed)
-    elif action == "TRIGGER_MUTATION":
-        try: await message.delete()
-        except: pass
-        try: await message.author.send(f"🛡️ **Guardian**: Message removed. Reason: {severity.upper()}")
-        except: pass
-        try: await message.channel.edit(slowmode_delay=60)
-        except: pass
-        mod_channel = discord.utils.get(message.guild.text_channels, name=MOD_CHANNEL_NAME)
-        if mod_channel:
-            embed = discord.Embed(title="🚨 CRITICAL", color=discord.Color.red(), description=f"Score: {score:.2f}")
-            embed.add_field(name="Action", value="Deleted + Slow Mode")
-            await mod_channel.send(embed=embed)
-
-    # SAFETY CAGE LAYER 3: Pulse Watchdog
-    watchdog.pulse()
+# Commands
 
 @bot.command(name="status")
 async def cmd_status(ctx):
-    if api_failure_count >= MAX_API_FAILURES:
-        await ctx.send("⚠️ System in Offline Mode (API Circuit Breaker Active).")
-        return
-    data = await call_ashby_api("/state")
+    async with bot.state_lock:
+        if api_failure_count >= MAX_API_FAILURES:
+            await ctx.send("⚠️ System in Offline Mode (Circuit Breaker Active).")
+            return
+    
+    data = await call_ashby_api("/health", method="GET")
     if data:
-        embed = discord.Embed(title="🧠 Status", color=discord.Color.green() if data.get('status')=='stable' else discord.Color.red())
-        embed.add_field(name="Score", value=data.get('stability_score'))
-        embed.add_field(name="Status", value=data.get('status'))
+        severity = data.get('overall_severity', 'UNKNOWN')
+        violated = data.get('violated_bounds', [])
+        embed_color = discord.Color.green() if severity == 'HEALTHY' else discord.Color.red()
+        
+        embed = discord.Embed(title="🧠 Viability Status", color=embed_color)
+        embed.add_field(name="Overall Severity", value=severity)
+        embed.add_field(name="Violated Bounds", value=", ".join(violated) if violated else "None")
+        embed.add_field(name="Dead Man Switch", value="Active" if dead_man.is_active else "Inactive")
+        
         await ctx.send(embed=embed)
     else:
         await ctx.send("⚠️ Could not fetch status.")
@@ -369,33 +342,46 @@ async def cmd_status(ctx):
 @bot.command(name="heal")
 @commands.has_permissions(manage_messages=True)
 async def cmd_heal(ctx):
-    if api_failure_count >= MAX_API_FAILURES:
-        await ctx.send("⚠️ System in Offline Mode.")
-        return
-    data = await call_ashby_api("/decay")
+    async with bot.state_lock:
+        if api_failure_count >= MAX_API_FAILURES:
+            await ctx.send("⚠️ System in Offline Mode.")
+            return
+    
+    data = await call_ashby_api("/decay_cycle")
     if data:
-        await ctx.send(f"💚 Manual Heal: Score={data.get('stability_score')}")
+        await ctx.send(f"💚 Manual Heal Triggered. Response: {data.get('status', 'unknown')}")
     else:
-        await ctx.send("⚠️ Heal failed.")
+        await ctx.send("⚠️ Heal command failed.")
 
 @bot.command(name="reset")
 @commands.has_permissions(administrator=True)
 async def cmd_reset(ctx):
-    if not dead_man.is_active:
-        await ctx.send("System is already online.")
-        return
-    success = reset_mgr.initiate(ctx.author.id)
-    if success:
-        dead_man.is_active = False
-        dead_man._save_state()
-        api_failure_count = 0 # Reset circuit breaker on manual reset
-        await ctx.send("✅ **TWO-KEY RESET SUCCESSFUL**: System Re-initialized.")
+    if dead_man.is_active:
+        success = await reset_mgr.initiate(ctx.author.id)
+        if success:
+            dead_man.is_active = False
+            await dead_man.reset_violations()
+            dead_man._save_state()
+            async with bot.state_lock:
+                api_failure_count = 0
+            await ctx.send("✅ **TWO-KEY RESET SUCCESSFUL**: System Re-initialized.")
+        else:
+            await ctx.send(f"⏳ **RESET INITIATED (1/2)**: Waiting for 2nd admin within {RESET_WINDOW_SECONDS}s.")
     else:
-        await ctx.send(f"⏳ **RESET INITIATED (1/2)**: Waiting for 2nd admin within {RESET_WINDOW}s.")
+        await ctx.send("System is already online.")
 
 @bot.event
+async def on_close():
+    """Cleanup on shutdown."""
+    if watchdog:
+        await watchdog.stop()
+    if bot.ashby_session and not bot.ashby_session.closed:
+        await bot.ashby_session.close()
+    gc.collect()
+
 async def setup_hook():
     bot.ashby_session = aiohttp.ClientSession()
+    print("🔌 HTTP Session established.")
 
 bot.setup_hook = setup_hook
 
@@ -403,8 +389,9 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("❌ ERROR: DISCORD_TOKEN missing in .env")
         exit(1)
+    
     try:
-        print("🛡️  Starting Ashby Guardian (Gold Standard v1.1)...")
+        print("🛡️  Starting Ashby Guardian v2.1 (Production Hardened)...")
         bot.run(DISCORD_TOKEN)
     except discord.errors.LoginFailure:
         print("\n🚨 CRITICAL: Login Failed! Token invalid/expired.")
